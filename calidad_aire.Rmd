@@ -1,0 +1,468 @@
+---
+title: "Calidad del aire en Madrid, 2018"
+author: "Virginia Peón García"
+date: "16/06/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Objetivo
+
+Hacer una primera aproximación a los datos disponibles sobre la contaminación en el municipio de Madrid.
+
+Vamos a analizar los datos de NO~2~ de 2018 siguiendo estos pasos:
+
+* Descarga y extracción de los datos
+
+* Limpieza de de los datos
+
+* Análisis univariante de la serie temporal
+
+* Enriquecimiento de los datos con otras fuentes
+
+* Análisis multivariante de los datos
+
+* Planteamiento de un modelo predictivo
+
+
+
+Las librerías que vamos a usar son:
+```{r results='hide', message=FALSE, warning=FALSE}
+pkgs <- c("lubridate", "data.table", "ggplot2", "prophet", "ggExtra", "leaflet", "magrittr", "dplyr", "leaflet", "gplots", "xts")
+lapply(pkgs, library, character.only = TRUE, quietly = T)
+```
+
+
+
+
+## Descarga y extracción de los datos
+
+
+Los datos de calidad del aire se han descargado desde el [portal de datos abiertos de Madrid](https://datos.madrid.es/portal/site/egob/menuitem.c05c1f754a33a9fbe4b2e4b284f1a5a0/?vgnextoid=f3c0f7d512273410VgnVCM2000000c205a0aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD&vgnextfmt=default) y se han almacendo descomprimidos dentro de la carpeta `Anio201810` en `data_input`.
+
+Vamos a unificar la información de los ficheros de la calidad del aire en un único _data frame_ llamado `raw_air_quality`.
+
+```{r}
+path_files_air <- "data_input/Anio201810/"
+file_list <- list.files(path = path_files_air, pattern = ".csv")
+
+raw_air_quality <- data.frame()
+for (file in 1:length(file_list)) {
+    path_file <- paste0(path_files_air, file_list[file])
+    raw_file <- read.csv(path_file, header = TRUE, sep=";")
+    raw_air_quality <- rbind(raw_air_quality, raw_file)
+}
+
+rm(raw_file)
+dim(raw_air_quality)
+```
+
+
+
+Cada fila hace referencia a todas las medidas tomadas hora a hora durante el mismo día en una misma estación.
+```{r}
+names(raw_air_quality)
+```
+
+
+## Transformación de los datos
+
+
+Vamos a trabajar sólo con los datos de  NO~2~, cuya magnitud está codificada como 8.
+```{r}
+air_quality <- raw_air_quality[raw_air_quality$MAGNITUD == 8, ]
+```
+
+
+Para simplificar posteriores análisis, añadimos una nueva columna con el código de las estaciones que corresponde con los 8 primeros dígitos del campo `PUNTO_MUESTREO`. Es la concatenación del los identificadores de provincia más municipio junto con el de la estación.
+
+```{r}
+station <- as.numeric(substr(air_quality$PUNTO_MUESTREO, 1, 8))
+```
+
+
+Reajustemos el formato para que cada línea contenga sólo datos verificados, por estación, día y hora.
+
+Vamos a usar un _data frame_, `air_quality_by_days`, con la información de estación y fecha que utilizaremos como base para desglosar por fila los valores de NO~2~ y validez, por cada hora del día.
+
+
+
+```{r}
+air_quality_by_days <- data.frame(
+    station, year = air_quality$ANO,
+    month = ifelse(air_quality$MES < 10, paste0("0", air_quality$MES), air_quality$MES),
+    day = air_quality$DIA,
+    stringsAsFactors = FALSE
+)
+str(air_quality_by_days)
+```
+
+__Nota__: Resto una unidad al índice de hora para que la hora esté en el rango 0 a 23.
+
+```{r}
+air_quality_by_hour <- data.frame()
+
+for (hour in 1:24) {
+    air_quality_by_days$hour <- hour - 1
+    air_quality_by_days$no2 <- air_quality[ , (2 * hour + 7)]
+    air_quality_by_days$verif <- air_quality[ , (2 * hour + 8)]
+
+    air_quality_by_hour <- rbind(air_quality_by_hour, air_quality_by_days)
+}
+
+rm(air_quality_by_days)
+```
+
+
+Nos quedamos sólo con los datos verificados:
+```{r}
+air_quality_by_hour$no2[air_quality_by_hour$verif != "V"] <- NA
+```
+
+
+Y añadimos una columna que contenga la fecha en formato estándar.
+```{r}
+air_quality_by_hour$date <- ymd_hms(paste0(
+    air_quality_by_hour$year, "-", air_quality_by_hour$month, "-", air_quality_by_hour$day,
+    " ", gsub(pattern = "H", replacement = "", air_quality_by_hour$hour), ":00:00"
+))
+
+str(air_quality_by_hour)
+```
+
+
+## Análisis de la serie temporal
+
+### Exploración de los datos
+
+Primero obtengamos una visión de la tendencia en 2018:
+
+```{r}
+air_quality_by_day <- air_quality_by_hour
+air_quality_by_day$date <- as.Date(air_quality_by_day$date, format = "%Y-%m-%d")
+
+dt_no2 <- data.table(air_quality_by_day)[ , .(median_no2 = median(no2, na.rm = T)), by = .(date)]
+names(dt_no2) <- c("ds", "y")
+
+ggplot(data = dt_no2, aes(x = ds, y = y)) + geom_line(color = "#1F77B4") +
+    geom_smooth(method = 'loess', color = "#1F77B4", linetype = 2) +
+    labs(x = "", y = expression(NO[2]))
+```
+
+Y por días de la semana:
+
+```{r}
+air_quality_by_day$weekday <- weekdays(air_quality_by_day$date)
+air_quality_by_day$weekday <- factor(
+    air_quality_by_day$weekday,
+    levels=c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+)
+air_quality_by_day <- air_quality_by_day[order(air_quality_by_day$weekday), ]
+
+ggplot(air_quality_by_day, aes(x = weekday, y = no2)) + geom_boxplot(fill = "#5fa2ce") +
+    labs(x = "", y = expression(NO[2]))
+```
+
+Obsevando la componente semanal y la anual podemos llegar a la conclusión de que el nivel de NO~2~ baja en días _festivos_, pero también en los _no lectivos_.
+
+Como __boceto__ visual de cómo serían los mapas de calor muestro éste de horas frente días del mes (nota: habría que eliminar los datos no verificados y cambiar la leyenda de los ejes para que fuera más fácil de leer).
+
+```{r}
+air_quality <- select(raw_air_quality, -contains("V"))
+air_quality_by_day_by_hour <- select(air_quality, 7:ncol(air_quality))
+aggdata <- aggregate(
+  air_quality_by_day_by_hour,
+  by = list(air_quality_by_day_by_hour$DIA),
+  FUN = mean, na.rm = TRUE
+)
+aggdata <- data.matrix(aggdata[ -c(1, 2)])
+
+colheatmap <- c("#1c5998", "#1c73b1", "#3a87b7", "#67add4","#7bc8e2","#cacaca", "#fdab67", "#fd8938","#f06511", "#d74401", "#a33202")
+heatmap.2(
+  aggdata,
+  dendrogram = "none",
+  Colv = NA,
+  Rowv = NA,
+  density.info = "none",
+  trace = "none",
+  col = colheatmap
+)
+
+```
+
+Como era previsible, en las horas nocturnas, con poco tráfico rodado, también baja el nivel de NO~2~.
+Quedaría pendiente analizar, desglosándolo por meses, por qué a veces se produce una mayor concentración a última hora del día, sobre todo a final de mes.
+
+
+¿Y si vemos cómo se comportan los valores máximos y mínimos frente a la mediana?
+
+```{r}
+dt_no2 <- data.table(air_quality_by_day)[ , .(
+    median_no2 = median(no2, na.rm = T),
+    min_no2 = min(no2, na.rm = T),
+    max_no2 = max(no2, na.rm = T) ), by = .(date)]
+
+ggplot(dt_no2, aes(date)) +
+    geom_line(aes(y = min_no2), color = "#5f9ed1") +
+    geom_line(aes(y = max_no2), color = "#fbb04e") +
+    geom_line(aes(y = median_no2), color = "#006ba4") +
+    labs(x = "", y = expression(NO[2]))
+
+```
+
+Tanta diferencia entre los valores extremos dentro del mismo día pueden ser debidos a que las mediciones se han tomado en distintas zonas geográficas. Debemos introducir más fuentes de datos para poder seguir investigando.
+
+
+
+### Forecasting
+
+He probado [Prophet](https://facebook.github.io/prophet/docs/quick_start.html#r-api), pero en este caso no lo recomiendo pues hace una previsión de NO~2~ muy alta para enero de 2019, lo que desvirtúa el resto del análisis. Posiblemente se corregiría si incluyéramos más años en el análisis, o bien podríamos hacer un análisis ARIMA.
+
+```{r}
+dt_no2 <- data.table(air_quality_by_day)[ , .(median_no2 = median(no2, na.rm = T)), by = .(date)]
+names(dt_no2) <- c("ds", "y")
+
+m <- prophet(dt_no2, daily.seasonality = TRUE, yearly.seasonality = TRUE )
+
+future <- make_future_dataframe(m, periods = 360)
+forecast <- predict(m, future)
+plot(m, forecast)
+prophet_plot_components(m, forecast)
+```
+
+Otros análisis mulltivariantes que podrían ser interesantes:
+
+* Análisis de ANOVA determinar si existen diferencias estadísticamente significativas de NO~2~ entre las horas del día, entre días de la semana, entre días festivos, entre días lectivos, entre días del mes o entre los meses.
+* Mapa de calor entre día de la semana y hora.
+* Mapa de calor entre día de la semana y día del mes.
+* Estudiar los puntos _outliers_ que se ven en el _boxplot_ NO~2~ de por semana.
+
+## Enriquecimiento de los datos con otras fuentes
+
+Vamos a enriquecer estos datos con la geolocalización de las estaciones de medición, así como la medida de la temperatura.
+
+
+Utilizaremos la información de las estaciones contenida en el fichero `madrid_air_quality_stations.csv` de la carpeta `data_input`, extraído de [aquí](https://gist.github.com/koldLight/533038c852ca0a546da247292b5d9ab9):
+```{r}
+stations <- read.csv("data_input/madrid_air_quality_stations.csv", header = TRUE, sep = ",")
+str(stations)
+
+```
+
+```{r}
+df_air <- merge(air_quality_by_hour, stations)
+str(df_air)
+```
+
+
+Utilizaremos la información de temperaturas medias por días contenidas en el archivo `madrid_hourly_temperatures_2018.csv` de la carpeta `data_input`, extraído de [aquí](https://gist.github.com/koldLight/90577c60ad4267d4df490e6239cebf58).
+
+Llamaremos `date_day` a la columna con la información del día y `date` a una nueva columna que incluya también la hora:
+
+
+```{r}
+temperatures <- read.csv("data_input/madrid_hourly_temperatures_2018.csv", header = TRUE, sep = ",")
+temperatures$date_day <- ymd(temperatures$date)
+temperatures$date <- ymd_hms(paste(temperatures$date_day, temperatures$hour), truncated = 3)
+str(temperatures)
+
+```
+
+
+Guardamos toda la información en un único _data frame_ y lo exportamos a un fichero para futuros análisis:
+```{r}
+df_air <- merge(df_air, temperatures)
+write.csv(df_air, file = "data_output/df_air.csv", row.names = FALSE)
+str(df_air)
+```
+
+
+## Análisis multivariante de los datos
+
+
+Al analizar la relación entre el nivel de NO~2~ y la temperatura no se observa que exista correlación:
+```{r}
+p <- ggplot(df_air, aes(x = temp, y = no2, color = -temp)) +
+    geom_point() +
+    theme(legend.position = "none") +
+    labs(x = "Temperatura", y = expression(NO[2]))
+ggMarginal(p, type = "histogram", fill = "#1F77B4")
+```
+
+
+
+Ni aunque lo desglosemos por cada una de las estaciones:
+```{r}
+ggplot(df_air, aes(x = temp, y = no2, color = -temp)) +
+    geom_point() +
+    theme(legend.position = "none") +
+    facet_wrap( ~ name) +
+    labs(x = "Temperatura", y = expression(NO[2]))
+```
+
+
+Lo que sí nos da una pista es que existe mucha variación entre el nivel de NO~2~ de las distintas estaciones.
+
+Vamos a comparar los valores medianos haciendo tres grupos según al cuartil en el que estén los datos:
+```{r}
+station_media <- df_air %>%
+    group_by(name) %>%
+    summarise( no2 = median(no2, na.rm = TRUE)) %>%
+    arrange(desc(no2))
+
+station_media <- as.data.frame(station_media)
+station_media$name <- factor(station_media$name,
+                             levels = station_media$name)
+station_media <- station_media[order(station_media$name), ]
+
+station_media$level_no2 <- "high"
+station_media$level_no2[station_media$no2 < quantile(station_media$no2)[4]] <- "medium"
+station_media$level_no2[station_media$no2 < quantile(station_media$no2)[2]] <- "low"
+
+ggplot(station_media, aes(x=name, y = no2, group = factor(level_no2), fill = factor(level_no2))) +
+    scale_fill_manual(values = c("#fc7d0b", "#1170aa", "#5fa2ce")) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(x = "", y = expression(NO[2]))
+```
+
+
+Y la relación entre las estaciones y su localización geográfica:
+```{r}
+station_media <- merge(station_media, stations)
+
+station_media$color_no2 <- "red"
+station_media$color_no2[station_media$no2 < quantile(station_media$no2)[4] ] <- "orange"
+station_media$color_no2[station_media$no2 < quantile(station_media$no2)[2] ] <- "green"
+
+icons <- awesomeIcons(
+    icon = 'ios-close',
+    iconColor = station_media$color_no2,
+    library = 'ion',
+    markerColor = station_media$color_no2
+)
+
+leaflet(station_media) %>% addTiles() %>%
+    addAwesomeMarkers(lng = station_media$longitude,
+                      lat = station_media$latitude,
+                      icon = icons,
+                      label = ~paste(name, "-", as.character(no2)))
+```
+
+
+Podemos apreciar cómo las zonas más céntricas contienen mayor nivel de NO~2~. La excepción es la estación que se encuentra situada en el Parque de «El Retiro», que tiene un nivel de 22, menos de la mitad que «Escuelas Aguirre» con 51.
+
+
+Nota: A la vista de los resultados deberíamos incluir «Castellana» dentro del grupo `high`.
+
+
+
+## Planteamiento de modelo de predicción
+
+Variable a predecir: NO~2~
+
+Variables independientes:
+
+* Estación se encuentra en zona verde
+* Día de la semana
+* Día festivo laboral
+* Día festivo escolar
+* Temperatura
+* Velocidad del viento
+* Humedad
+* Precipitación
+
+Sería deseable tener variables meteorológicas por cada estación por día e incluso por hora.
+
+Además, tener histórico de más años, nos va a ayudaría a determinar la estacionalidad de los datos.
+
+
+
+Primero dividiríamos el conjunto de datos en dos grupos: entrenamiento y testeo.
+
+Para evitar sobreajustes podemos personalizar los parámetros del conjunto de entrenamiento con la función _trainControl_ de la librería _caret_, por ejemplo, haciendo _k-fold cross-validation_ que se repita _r_ veces
+
+```{r eval = FALSE}
+library(caret)
+control <- trainControl(method = "repeatedcv", number = k, repeats = r)
+```
+
+
+
+Podríamos probar con los algoritmos: _randomForest_, _xgboost_, _glmnet_ para ver cuál hace una mejor predicción:
+
+```{r eval = FALSE}
+
+library(randomForest)
+library(xgboost)
+library(glmnet)
+
+fit.rf <- train(no2~. , data, method = "rf", trControl = control, na.action = na.exclude)
+fit.xg <- train(no2~. , data, method = "xgbLinear", trControl = control, na.action = na.exclude)
+fit.gl <- train(no2~. , data, method = "glmnet", trControl = control, na.action = na.exclude)
+
+results <- resamples(list(RF = fit.rf, XG = fit.xg, GL = fit.gl))
+
+```
+
+
+Y, por último, tendríamos que analizar qué modelo nos conviene tomar:
+```{r eval = FALSE}
+summary(results)
+scales <- list(x = list(relation = "free"), y = list(relation = "free"))
+bwplot(results, scales = scales)
+
+```
+
+
+[Aquí](https://topepo.github.io/caret/model-training-and-tuning.html#resamp) hay más ejemplos del análisis para decidir entre los distintos algoritmos.
+
+
+
+
+## Resumen
+
+1. Descarga y extracción de los datos.
+    + Carga de los datos de calidad del aire de Madrid.
+    + _Pendiente_: Tomar al menos otro año para mejorar los análisis posteriores.
+    + _Conclusiones_: Hay que tratar los datos pues no viene en formato estándar.
+
+2. Limpieza de de los datos.
+    + Filtrado el conjunto de datos solo para la magnitud NO~2~.
+    + Transformación del formato para que cada línea contenga datos verificados por estación, día y hora.
+    + Eliminación de los datos no validados.
+    + Agregación de una columna con formato de fecha.
+
+3. Análisis univariante de la serie temporal.
+    + Exploración visual de los datos de forma anual, semanal, y horas frente días del mes.
+    + Análisis predictivo con _Prophet_.
+    + _Pendiente_:
+        + Análisis de ANOVA para ver las diferencias significativas de NO~2~ entre las horas del día, entre días de la semana, entre días del mes o entre los meses.
+        + Mapa de calor entre día de la semana y hora.
+        + Mapa de calor entre día de la semana y día del mes.
+        + Estudiar los puntos _outliers_ que se ven en el _boxplot_ NO~2~ por semana.
+        + Análisis predictivo ARIMA.
+    + _Conclusiones_: El nivel de NO~2~  baja en días festivos, en los no lectivos y en las horas nocturnas.
+
+4. Enriquecimiento de los datos con otras fuentes.
+    + Tratamiento de los datos para incluir datos de temperaturas y de estaciones.
+    + _Pendiente_: Añadir más fuentes como días festivos y días lectivos.
+
+5. Análisis multivariante de los datos.
+    + Análisis de la relación entre nivel de NO~2~ con la temperatura y con las distintas estaciones de medición.
+    + _Pendiente_:
+        + Mapa de calor animado sobre el mapa de Madrid para ver cómo evoluciona el nivel de    NO~2~ con el temperatura según las estaciones.
+        + Análisis de ANOVA para ver las diferencias significativas de NO~2~ entre entre días festivos y otro entre días lectivos.
+    + _Conclusiones_:
+        + No se ve relación entre el nivel de NO~2~ y la temperatura.
+        + Podemos apreciar cómo las zonas más céntricas contienen mayor nivel de NO~2~. La excepción es la estación que se encuentra situada en el Parque de «El Retiro», que tiene un nivel de 22, menos de la mitad que «Escuelas Aguirre» con 51.
+
+6. Planteamiento de modelo predictivo.
+    + Planteamiento de cómo hacer el modelo.
+    + _Pendiente_: Desarrollarlo.
